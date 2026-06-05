@@ -217,8 +217,27 @@ async function svgToDataUri(svg) {
   return "data:image/png;base64," + buf.toString("base64");
 }
 
+// ─── Custom icon directories (additive) ───
+// A theme can register a directory of <name>.svg files; iconToDataUri resolves
+// `icon: "<name>"` from these dirs before falling back to brand/FA icons.
+// Used by per-course themes (e.g. pillippa.cl cat icons). Default: none registered,
+// so existing courses are unaffected.
+const ICON_DIRS = [];
+function registerIconDir(dir) {
+  try { if (dir && fs.existsSync(dir) && !ICON_DIRS.includes(dir)) ICON_DIRS.push(dir); } catch (_) {}
+}
+
 async function iconToDataUri(iconName, colorOverride, size) {
-  // Brand icon first
+  // Custom registered SVG icons first (by file name, e.g. "cat_curious_teal")
+  if (iconName && ICON_DIRS.length) {
+    for (const dir of ICON_DIRS) {
+      const f = path.join(dir, iconName.endsWith(".svg") ? iconName : iconName + ".svg");
+      try {
+        if (fs.existsSync(f)) return svgToDataUri(fs.readFileSync(f, "utf8"));
+      } catch (_) { /* keep looking */ }
+    }
+  }
+  // Brand icon next
   if (BRAND_ICONS.includes(iconName)) {
     return svgToDataUri(brandIconSvg(iconName, size || 256));
   }
@@ -475,17 +494,51 @@ async function generateSlides(config) {
 
   // ─── Logo ───
   let LOGO_DATA = null;
-  const logoPath = config.logoPath || path.resolve(__dirname, "../../..", "Logo.png");
+  // Logo: busca en assets/Logo.png primero (ubicación nueva), luego en la raíz (legacy).
+  let logoPath = config.logoPath;
+  if (!logoPath) {
+    const repoRoot = path.resolve(__dirname, "../../..");
+    const candidates = [
+      path.join(repoRoot, "assets", "Logo.png"),
+      path.join(repoRoot, "Logo.png"),
+    ];
+    logoPath = candidates.find(p => { try { return fs.existsSync(p); } catch (_) { return false; } }) || candidates[0];
+  }
   try {
     if (fs.existsSync(logoPath)) {
       LOGO_DATA = "image/png;base64," + fs.readFileSync(logoPath).toString("base64");
     }
   } catch (_) { /* logo optional */ }
 
+  // Optional bg-aware logo variants (additive). If a theme provides logoPathDark
+  // (for light backgrounds) and/or logoPathLight (for dark backgrounds), placeLogo
+  // picks the one that contrasts with each slide's background. If not provided,
+  // it falls back to LOGO_DATA — so existing single-logo courses are unaffected.
+  let LOGO_DATA_DARK = null, LOGO_DATA_LIGHT = null;
+  try { if (config.logoPathDark && fs.existsSync(config.logoPathDark)) LOGO_DATA_DARK = "image/png;base64," + fs.readFileSync(config.logoPathDark).toString("base64"); } catch (_) {}
+  try { if (config.logoPathLight && fs.existsSync(config.logoPathLight)) LOGO_DATA_LIGHT = "image/png;base64," + fs.readFileSync(config.logoPathLight).toString("base64"); } catch (_) {}
+
+  function bgLuminance(hex) {
+    if (!hex || typeof hex !== "string") return 1; // assume light if unknown
+    const h = hex.replace("#", "");
+    if (h.length < 6) return 1;
+    const r = parseInt(h.slice(0, 2), 16) / 255;
+    const g = parseInt(h.slice(2, 4), 16) / 255;
+    const b = parseInt(h.slice(4, 6), 16) / 255;
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  }
+
   function placeLogo(slide) {
-    if (!LOGO_DATA) return;
+    // Choose the contrasting variant based on this slide's background.
+    const bg = slide.background && slide.background.color;
+    const darkBg = bgLuminance(bg) < 0.18; // magenta(#FF0080)≈0.25 counts as light → dark logo
+    let data = LOGO_DATA;
+    if (LOGO_DATA_DARK || LOGO_DATA_LIGHT) {
+      data = darkBg ? (LOGO_DATA_LIGHT || LOGO_DATA) : (LOGO_DATA_DARK || LOGO_DATA);
+    }
+    if (!data) return;
     slide.addImage({
-      data: LOGO_DATA, x: 8.3, y: 0.15, w: 0.9, h: 0.9,
+      data, x: 8.3, y: 0.15, w: 0.9, h: 0.9,
       sizing: { type: "contain", w: 0.9, h: 0.9 }
     });
   }
@@ -626,6 +679,7 @@ async function generateSlides(config) {
 
   // Pixel-smiley peeking from a corner (brand warmth on content slides)
   async function placeSmileyPeek(slide, position) {
+    if (config.suppressRetro) return; // themes can disable the Niñas Pro pixel-art
     const data = await iconToDataUri("pixel-smiley", null, 256);
     if (!data) return;
     const positions = {
@@ -698,20 +752,25 @@ async function generateSlides(config) {
       x: 0.6, y: hasTagline ? 5.1 : 4.8, w: 5.8, h: 0.4,
       fontSize: 13, fontFace: C.FONT, color: "CCCCDD", margin: 0
     });
-    // Retro pixel-art composition (right side) — brandbook signature
-    // Big frame holding the pixel-smiley
-    placeRetroFrame(slide, 6.3, 1.8, 2.0, 2.2, { stroke: C.WHITE });
-    const smileyData = await iconToDataUri("pixel-smiley", null, 256);
-    if (smileyData) slide.addImage({ data: smileyData, x: 6.55, y: 2.15, w: 1.5, h: 1.5 });
-    // Pixel cursor pointing to the smiley
-    const cursorData = await iconToDataUri("pixel-cursor", null, 128);
-    if (cursorData) slide.addImage({ data: cursorData, x: 8.2, y: 3.3, w: 0.5, h: 0.5 });
-    // Letter-A frame composition with squiggle
-    placeRetroFrame(slide, 7.4, 4.1, 1.7, 1.4, { stroke: C.WHITE });
-    const letterAData = await iconToDataUri("letter-a-frame", null, 256);
-    if (letterAData) slide.addImage({ data: letterAData, x: 7.55, y: 4.25, w: 1.4, h: 1.2 });
-    placeStar(slide, 6.0, 4.6, 0.3, C.ROSE);
-    placeStar(slide, 8.8, 1.4, 0.25, C.YELLOW);
+    if (config.suppressRetro) {
+      // Theme without the Niñas Pro pixel-art: optional hero icon on the right.
+      if (d.heroIcon) {
+        const heroData = await iconToDataUri(d.heroIcon, null, 512);
+        if (heroData) slide.addImage({ data: heroData, x: 6.4, y: 1.7, w: 3.0, h: 3.0, sizing: { type: "contain", w: 3.0, h: 3.0 } });
+      }
+    } else {
+      // Retro pixel-art composition (right side) — brandbook signature
+      placeRetroFrame(slide, 6.3, 1.8, 2.0, 2.2, { stroke: C.WHITE });
+      const smileyData = await iconToDataUri("pixel-smiley", null, 256);
+      if (smileyData) slide.addImage({ data: smileyData, x: 6.55, y: 2.15, w: 1.5, h: 1.5 });
+      const cursorData = await iconToDataUri("pixel-cursor", null, 128);
+      if (cursorData) slide.addImage({ data: cursorData, x: 8.2, y: 3.3, w: 0.5, h: 0.5 });
+      placeRetroFrame(slide, 7.4, 4.1, 1.7, 1.4, { stroke: C.WHITE });
+      const letterAData = await iconToDataUri("letter-a-frame", null, 256);
+      if (letterAData) slide.addImage({ data: letterAData, x: 7.55, y: 4.25, w: 1.4, h: 1.2 });
+      placeStar(slide, 6.0, 4.6, 0.3, C.ROSE);
+      placeStar(slide, 8.8, 1.4, 0.25, C.YELLOW);
+    }
     slide.addNotes(d.notes || "");
   }
 
@@ -768,9 +827,11 @@ async function generateSlides(config) {
       const data = await iconToDataUri(d.icon, C.PURPLE, 256);
       if (data) iconImg = data;
     }
+    const iconSz = d.iconSize || 0.6; // themes with line icons can request a larger size
     if (iconImg) {
-      slide.addImage({ data: iconImg, x: 0.75, y: 1.95, w: 0.6, h: 0.6 });
+      slide.addImage({ data: iconImg, x: 0.75, y: 1.95, w: iconSz, h: iconSz });
     }
+    const bodyX = iconImg ? (0.75 + iconSz + 0.35) : 0.75;
     const bodyPara = (d.body || []).map((t) => ({
       text: t.text || t,
       options: {
@@ -781,7 +842,7 @@ async function generateSlides(config) {
       }
     }));
     slide.addText(bodyPara, {
-      x: iconImg ? 1.6 : 0.75, y: 1.95, w: iconImg ? 6.6 : 7.5, h: 2.5,
+      x: bodyX, y: 1.95, w: 9.2 - bodyX, h: 2.5,
       fontFace: C.FONT, valign: "top", lineSpacingMultiple: 1.5
     });
     // Pixel smiley peeking from bottom-right corner (brand warmth)
@@ -933,6 +994,12 @@ async function generateSlides(config) {
       fontSize: 28, fontFace: C.FONT, color: C.PURPLE, bold: true,
       valign: "middle", margin: 0
     });
+    // Optional icon (bottom-right, away from the logo). Additive: only if `icon` set.
+    if (d.icon) {
+      const iconData = await iconToDataUri(d.icon, colorVal(d.accentColor) || C.PURPLE, 256);
+      const isz = d.iconSize || 0.9;
+      if (iconData) slide.addImage({ data: iconData, x: 9.4 - isz, y: 5.4 - isz, w: isz, h: isz });
+    }
     if (d.subtitle) {
       slide.addText(d.subtitle, {
         x: 0.75, y: 1.45, w: 8.5, h: 0.4,
@@ -1148,8 +1215,8 @@ async function generateSlides(config) {
       fontSize: 26, fontFace: C.FONT, color: C.PURPLE, bold: true,
       valign: "middle", margin: 0
     });
-    // Code on the left
-    const codeX = 0.6, codeY = 1.2, codeW = 4.2, codeH = 3.8;
+    // Code on the left — start BELOW the title (title spans y0.85→1.4) to avoid overlap.
+    const codeX = 0.6, codeY = 1.55, codeW = 4.2, codeH = 3.5;
     slide.addShape(pres.shapes.RECTANGLE, {
       x: codeX, y: codeY, w: codeW, h: codeH, fill: { color: C.NAVY }
     });
@@ -1165,7 +1232,7 @@ async function generateSlides(config) {
       valign: "top", margin: 0, lineSpacingMultiple: 1.25
     });
     // Trace table on the right
-    const tblX = 5.0, tblY = 1.2, tblW = 4.4, tblH = 3.8;
+    const tblX = 5.0, tblY = 1.55, tblW = 4.4, tblH = 3.5;
     slide.addShape(pres.shapes.RECTANGLE, {
       x: tblX, y: tblY, w: tblW, h: tblH,
       fill: { color: C.ROSE }, line: { color: C.NAVY, width: 0 }
@@ -1176,7 +1243,15 @@ async function generateSlides(config) {
       letterSpacing: 2, margin: 0
     });
     const headers = d.headers || ["Paso", "Variable", "Valor"];
-    const colWs = d.colW || [0.7, 1.4, 2.0];
+    // Adaptive column widths spanning the card interior so a 4th+ column never
+    // overflows the right edge (previous bug: undefined width for extra columns).
+    const tblInnerW = tblW - 0.3;
+    let colWs = d.colW;
+    if (!colWs || colWs.length < headers.length) {
+      const firstW = 0.65;
+      const restW = headers.length > 1 ? (tblInnerW - firstW) / (headers.length - 1) : tblInnerW;
+      colWs = [firstW, ...Array(Math.max(0, headers.length - 1)).fill(restW)];
+    }
     let colX = tblX + 0.15;
     headers.forEach((h, i) => {
       slide.addText(h, {
@@ -1189,13 +1264,18 @@ async function generateSlides(config) {
     slide.addShape(pres.shapes.RECTANGLE, {
       x: tblX + 0.15, y: tblY + 0.78, w: tblW - 0.3, h: 0.02, fill: { color: C.PURPLE }
     });
-    (d.rows || []).forEach((row, i) => {
-      const yRow = tblY + 0.9 + i * 0.35;
+    const traceRows = d.rows || [];
+    // Adaptive row height so more steps still fit inside the card.
+    const traceRowH = traceRows.length
+      ? Math.min(0.4, (tblH - 1.05) / traceRows.length) : 0.35;
+    traceRows.forEach((row, i) => {
+      const yRow = tblY + 0.9 + i * traceRowH;
       let cellX = tblX + 0.15;
       row.forEach((cell, j) => {
         slide.addText(String(cell), {
-          x: cellX, y: yRow, w: colWs[j], h: 0.3,
-          fontSize: 13, fontFace: j === 2 ? C.FONT_CODE : C.FONT,
+          x: cellX, y: yRow, w: colWs[j], h: traceRowH,
+          fontSize: traceRowH < 0.34 ? 12 : 13,
+          fontFace: j === headers.length - 1 ? C.FONT_CODE : C.FONT,
           color: C.NAVY, valign: "middle", margin: 0
         });
         cellX += colWs[j];
@@ -1461,36 +1541,55 @@ async function generateSlides(config) {
       fontSize: 28, fontFace: C.FONT, color: C.PURPLE, bold: true,
       valign: "middle", margin: 0
     });
-    const cardX = 0.6, cardY = 1.2, cardW = 8.8, cardH = d.cardH || 3.8;
+    // ─── Adaptive geometry: fit any column count and row count inside the card ───
+    const cardX = 0.6, cardY = 1.2, cardW = 8.8;
+    const nRows = (d.rows || []).length;
+    const ncols = d.headers ? d.headers.length : 3;
+    // Compute default column x/width spanning the card interior [1.0 .. 9.0].
+    // First column is narrow (holds the big symbol/type); the rest split evenly.
+    const innerL = 1.0, innerR = 9.0, innerW = innerR - innerL;
+    let colX = d.colX, colW = d.colW;
+    if (!colX || !colW) {
+      const firstW = ncols > 1 ? 1.4 : innerW;
+      const restW = ncols > 1 ? (innerW - firstW) / (ncols - 1) : 0;
+      colW = [firstW, ...Array(Math.max(0, ncols - 1)).fill(restW)];
+      colX = [];
+      let acc = innerL;
+      for (let i = 0; i < ncols; i++) { colX.push(acc); acc += colW[i]; }
+    }
+    // Adaptive row height + font so N rows never overflow the card or hit the footer.
+    const maxCardH = 4.1;                 // card bottom stays ≤ 5.3"
+    const headZone = 0.8;                 // header label + underline area
+    const rowH = Math.min(0.55, nRows ? (maxCardH - headZone - 0.15) / nRows : 0.55);
+    const cardH = d.cardH || Math.min(maxCardH, headZone + nRows * rowH + 0.15);
+    const symFont = rowH < 0.45 ? 18 : (rowH < 0.52 ? 21 : 24);
+    const cellFont = rowH < 0.45 ? 13 : 15;
     slide.addShape(pres.shapes.RECTANGLE, {
       x: cardX, y: cardY, w: cardW, h: cardH,
       fill: { color: C.ROSE },
       shadow: { type: "outer", blur: 3, offset: 1, angle: 135, color: "000000", opacity: 0.08 }
     });
     if (d.headers) {
-      const colX = d.colX || [1.0, 2.5, 5.0];
-      const colW = d.colW || [1.5, 2.5, 4.0];
       d.headers.forEach((h, i) => {
         slide.addText(h, {
           x: colX[i], y: cardY + 0.1, w: colW[i], h: 0.4,
           fontSize: 14, fontFace: C.FONT, color: C.PURPLE, bold: true,
-          valign: "middle", margin: 0
+          align: i === 0 ? "center" : "left", valign: "middle", margin: 0
         });
       });
+      const lineEnd = colX[ncols - 1] + colW[ncols - 1];
       slide.addShape(pres.shapes.RECTANGLE, {
-        x: colX[0], y: cardY + 0.55, w: colX[0] + colW[0] + colW[1] + colW[2] - colX[0], h: 0.02,
+        x: colX[0], y: cardY + 0.55, w: lineEnd - colX[0], h: 0.02,
         fill: { color: C.PURPLE }
       });
     }
     (d.rows || []).forEach((row, i) => {
-      const colX = d.colX || [1.0, 2.5, 5.0];
-      const colW = d.colW || [1.5, 2.5, 4.0];
-      const yPos = cardY + 0.8 + i * 0.55;
+      const yPos = cardY + headZone + i * rowH;
       if (d.headers) {
         row.forEach((cell, j) => {
           slide.addText(cell, {
-            x: colX[j], y: yPos, w: colW[j], h: 0.45,
-            fontSize: j === 0 ? 24 : (j === 1 ? 16 : 15),
+            x: colX[j], y: yPos, w: colW[j], h: rowH,
+            fontSize: j === 0 ? symFont : (j === 1 ? cellFont + 1 : cellFont),
             fontFace: C.FONT, color: j === 0 ? C.PURPLE : C.NAVY,
             bold: j <= 1, align: j === 0 ? "center" : "left",
             valign: "middle", margin: 0
@@ -1498,18 +1597,18 @@ async function generateSlides(config) {
         });
       } else {
         slide.addText(row.sym, {
-          x: colX[0], y: yPos, w: colW[0], h: 0.45,
-          fontSize: 24, fontFace: C.FONT, color: C.PURPLE, bold: true,
+          x: colX[0], y: yPos, w: colW[0], h: rowH,
+          fontSize: symFont, fontFace: C.FONT, color: C.PURPLE, bold: true,
           align: "center", valign: "middle", margin: 0
         });
         slide.addText(row.name, {
-          x: colX[1], y: yPos, w: colW[1], h: 0.45,
-          fontSize: 16, fontFace: C.FONT, color: C.NAVY, bold: true,
+          x: colX[1], y: yPos, w: colW[1], h: rowH,
+          fontSize: cellFont + 1, fontFace: C.FONT, color: C.NAVY, bold: true,
           valign: "middle", margin: 0
         });
         slide.addText(row.desc, {
-          x: colX[2], y: yPos, w: colW[2], h: 0.45,
-          fontSize: 15, fontFace: C.FONT, color: C.NAVY,
+          x: colX[2] !== undefined ? colX[2] : colX[1] + colW[1], y: yPos, w: colW[2] || colW[1], h: rowH,
+          fontSize: cellFont, fontFace: C.FONT, color: C.NAVY,
           valign: "middle", margin: 0
         });
       }
@@ -2117,34 +2216,49 @@ async function generateSlides(config) {
     slide.addShape(pres.shapes.RECTANGLE, {
       x: 1.0, y: tableY + 0.4, w: 8.0, h: 0.02, fill: { color: C.PURPLE }
     });
-    // Rows
-    const rows = d.rows || [];
-    rows.slice(0, 5).forEach((r, i) => {
-      const y = tableY + 0.6 + i * 0.6;
+    // Rows — adaptive height so wrapped right-side text never overlaps the next row.
+    const rows = (d.rows || []).slice(0, 6);
+    const nRows = rows.length;
+    const startY = tableY + 0.6;          // 2.6
+    const bottomLimit = 5.5;
+    const rowH = nRows ? Math.min(0.66, (bottomLimit - startY) / nRows) : 0.6;
+    // With 5+ rows there isn't room for a separate label line, so collapse the
+    // right cell to a single inline paragraph ("Label — value") that wraps to ≤2 lines.
+    const inlineRight = nRows >= 5;
+    const leftFont = nRows >= 5 ? 13 : 14;
+    const rightFont = nRows >= 5 ? 12 : 13;
+    rows.forEach((r, i) => {
+      const y = startY + i * rowH;
       // Pink number
       placePinkNumber(slide, i + 1, 0.6, y, 0.32);
       // Left side (vida real)
       const isCodeLeft = typeof r.left === "string" && /[{};()=<>]/.test(r.left);
       slide.addText(r.left || "", {
-        x: 1.05, y, w: 3.6, h: 0.5,
-        fontSize: 14, fontFace: isCodeLeft ? C.FONT_CODE : C.FONT,
+        x: 1.05, y, w: 3.6, h: rowH,
+        fontSize: leftFont, fontFace: isCodeLeft ? C.FONT_CODE : C.FONT,
         color: C.NAVY, valign: "middle", margin: 0
       });
       // Arrow
       slide.addText("→", {
-        x: 4.65, y, w: 0.6, h: 0.5,
+        x: 4.65, y, w: 0.6, h: rowH,
         fontSize: 20, fontFace: C.FONT, color: C.YELLOW, bold: true,
         align: "center", valign: "middle", margin: 0
       });
       // Right side (tech)
       const isCodeRight = typeof r.right === "string" && /[{};()=<>]/.test(r.right);
-      slide.addText([
-        ...(r.rightLabel ? [{ text: r.rightLabel + "\n", options: { color: C.PURPLE, bold: true } }] : []),
-        { text: r.right || "", options: { color: C.NAVY, fontFace: isCodeRight ? C.FONT_CODE : C.FONT } },
-      ], {
-        x: 5.3, y, w: 4.0, h: 0.5,
-        fontSize: 13, fontFace: C.FONT, valign: "middle", margin: 0,
-        lineSpacingMultiple: 1.2
+      const rightRuns = inlineRight
+        ? [
+            ...(r.rightLabel ? [{ text: r.rightLabel + ": ", options: { color: C.PURPLE, bold: true } }] : []),
+            { text: r.right || "", options: { color: C.NAVY, fontFace: isCodeRight ? C.FONT_CODE : C.FONT } },
+          ]
+        : [
+            ...(r.rightLabel ? [{ text: r.rightLabel + "\n", options: { color: C.PURPLE, bold: true } }] : []),
+            { text: r.right || "", options: { color: C.NAVY, fontFace: isCodeRight ? C.FONT_CODE : C.FONT } },
+          ];
+      slide.addText(rightRuns, {
+        x: 5.3, y, w: 4.0, h: rowH,
+        fontSize: rightFont, fontFace: C.FONT, valign: "middle", margin: 0,
+        lineSpacingMultiple: 1.1
       });
     });
     slide.addNotes(d.notes || "");
@@ -2380,6 +2494,68 @@ async function generateSlides(config) {
     slide.addNotes(d.notes || "");
   }
 
+  async function buildDiagram(slide, d) {
+    // Embed a rendered diagram image (e.g. a Mermaid PNG) centered + contained on a
+    // lavender content slide, with title, optional subtitle and caption. The image is
+    // resolved from d.imagePath (absolute, or relative to the deck's output dir) or a
+    // d.image data URI. Keeps diagrams visual and on-brand without drawing shapes by hand.
+    slide.background = { color: C.LAVENDER_BG };
+    placeBrandFurniture(slide, { sectionLabel: d.sectionLabel });
+    placeAccent(slide, 0.85, colorVal(d.accentColor) || C.TEAL);
+    slide.addText(d.title || "Diagrama", {
+      x: 0.75, y: 0.85, w: 8.2, h: 0.55,
+      fontSize: 26, fontFace: C.FONT, color: C.PURPLE, bold: true,
+      valign: "middle", margin: 0
+    });
+    if (d.subtitle) {
+      slide.addText(d.subtitle, {
+        x: 0.75, y: 1.42, w: 8.5, h: 0.32,
+        fontSize: 14, fontFace: C.FONT, color: C.NAVY, italic: true, margin: 0
+      });
+    }
+    // Resolve the image source.
+    let imgArg = null;
+    if (d.image && typeof d.image === "string" && d.image.startsWith("data:")) {
+      imgArg = { data: d.image };
+    } else if (d.imagePath || d.image) {
+      let p = d.imagePath || d.image;
+      if (!path.isAbsolute(p)) {
+        const base = config.outputPath ? path.dirname(path.resolve(config.outputPath)) : process.cwd();
+        p = path.resolve(base, p);
+      }
+      try {
+        if (fs.existsSync(p)) imgArg = { path: p };
+        else console.warn("Diagram image not found:", p);
+      } catch (_) { /* ignore */ }
+    }
+    const hasCaption = !!d.caption;
+    const top = d.subtitle ? 1.95 : 1.6;
+    const bottom = hasCaption ? 5.0 : 5.3;
+    const boxW = 8.5, boxH = bottom - top, boxX = (10 - boxW) / 2;
+    if (imgArg) {
+      slide.addImage({
+        ...imgArg,
+        x: boxX, y: top, w: boxW, h: boxH,
+        sizing: { type: "contain", w: boxW, h: boxH },
+      });
+    } else {
+      // Graceful fallback so the deck still builds if a render is missing.
+      slide.addText(d.fallbackText || "[ diagrama pendiente de render ]", {
+        x: boxX, y: top, w: boxW, h: boxH,
+        fontSize: 16, fontFace: C.FONT, color: C.GRAY_MED, italic: true,
+        align: "center", valign: "middle", margin: 0
+      });
+    }
+    if (hasCaption) {
+      slide.addText(d.caption, {
+        x: 0.6, y: 5.05, w: 8.8, h: 0.35,
+        fontSize: 13, fontFace: C.FONT, color: C.GRAY_MED,
+        align: "center", valign: "middle", margin: 0
+      });
+    }
+    slide.addNotes(d.notes || "");
+  }
+
   async function buildTryIt(slide, d) {
     // Warm invitation before the practice block. "Inténtalo tú. Antes de seguir, prueba tú."
     // Per Clase-09-Funciones.pptx slide 15.
@@ -2446,15 +2622,16 @@ async function generateSlides(config) {
     if (smileyData) slide.addImage({ data: smileyData, x: 1.2, y: 0.9, w: 1.4, h: 1.4 });
     const cursorData = await iconToDataUri("pixel-cursor", null, 128);
     if (cursorData) slide.addImage({ data: cursorData, x: 2.4, y: 2.0, w: 0.45, h: 0.45 });
-    // Main message
-    slide.addText(d.title || "¡Gracias por hoy!", {
-      x: 3.0, y: 1.0, w: 6.5, h: 0.9,
-      fontSize: 40, fontFace: C.FONT, color: C.WHITE, bold: true,
+    // Main message — title can wrap to 2 lines, so reserve height and shrink long titles.
+    const titleText = d.title || "¡Gracias por hoy!";
+    slide.addText(titleText, {
+      x: 3.0, y: 0.95, w: 6.5, h: 1.2,
+      fontSize: titleText.length > 24 ? 32 : 38, fontFace: C.FONT, color: C.WHITE, bold: true,
       valign: "middle", margin: 0, lineSpacingMultiple: 1.0
     });
     if (d.subtitle) {
       slide.addText(d.subtitle, {
-        x: 3.0, y: 1.95, w: 6.5, h: 0.4,
+        x: 3.0, y: 2.25, w: 6.5, h: 0.4,
         fontSize: 16, fontFace: C.FONT, color: C.YELLOW, italic: true,
         valign: "middle", margin: 0
       });
@@ -2529,6 +2706,7 @@ async function generateSlides(config) {
     "manual-trace": buildManualTrace,
     flowchart: buildFlowchart,
     "flowchart-diagram": buildFlowchartDiagram,
+    diagram: buildDiagram,
     "error-code": buildErrorCode,
     reference: buildReference,
     glossary: buildGlossary,
@@ -2565,6 +2743,7 @@ module.exports = {
   generateSlides,
   validateSlideSequence,
   buildClassSkeleton,
+  registerIconDir,
   C,
   CODE_TOKENS,
   BRAND_ICONS,
